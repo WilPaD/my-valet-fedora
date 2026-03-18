@@ -139,6 +139,51 @@ if ($socket === false) {
 PHPEOF
 }
 
+# Escribe el shim de PHP en ~/.local/bin/php
+# El shim sube por los directorios buscando .php-version y ejecuta el binario correcto.
+# Esto permite que cualquier IDE (VS Code, Zed, JetBrains) detecte automáticamente
+# la versión de PHP del proyecto sin configuración adicional.
+write_php_shim() {
+  local shim_dir="$HOME/.local/bin"
+  local shim_path="$shim_dir/php"
+
+  mkdir -p "$shim_dir"
+  cat > "$shim_path" <<'SHIM'
+#!/bin/bash
+# Valet PHP shim — resuelve la versión de PHP según .php-version del proyecto
+
+resolve_binary() {
+  local version="$1"
+  local ver="${version#php@}"
+  local short="${ver/./}"
+  for candidate in \
+    "/usr/bin/php${short}" \
+    "/opt/remi/php${short}/root/usr/bin/php"; do
+    [ -x "$candidate" ] && { echo "$candidate"; return; }
+  done
+  echo "/usr/bin/php"
+}
+
+# Subir por los directorios buscando .php-version
+dir="$PWD"
+while [ "$dir" != "/" ]; do
+  if [ -f "$dir/.php-version" ]; then
+    exec "$(resolve_binary "$(cat "$dir/.php-version")")" "$@"
+  fi
+  dir=$(dirname "$dir")
+done
+
+# Sin .php-version — usar el global de valet o el sistema
+valet_default="$HOME/.config/valet/default-php"
+if [ -f "$valet_default" ]; then
+  exec "$(resolve_binary "$(cat "$valet_default")")" "$@"
+fi
+
+exec /usr/bin/php "$@"
+SHIM
+  chmod +x "$shim_path"
+}
+
 # Aplica SELinux para un directorio de proyecto
 selinux_project() {
   local dir=$1
@@ -193,6 +238,10 @@ if [ "$COMMAND" == "install" ]; then
 
   # Crear server.php (watchdog de hot files de Vite)
   write_server_php
+
+  # Shim de PHP: permite que cualquier IDE detecte la versión por proyecto via .php-version
+  echo "🔧 Instalando shim de PHP..."
+  write_php_shim
 
   TLD=$(get_tld)
 
@@ -960,6 +1009,9 @@ if [ "$COMMAND" == "uninstall" ]; then
     read -p "¿Eliminar $VALET_HOME (sites, certs, config)? (y/N): " -n 1 -r; echo
     [[ $REPLY =~ ^[Yy]$ ]] && rm -rf "$VALET_HOME"
   fi
+
+  # Eliminar shim de PHP
+  rm -f "$HOME/.local/bin/php"
 
   sudo systemctl restart php-fpm 2>/dev/null || true
   sudo systemctl restart nginx  2>/dev/null || true
