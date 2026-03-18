@@ -1217,6 +1217,125 @@ XEOF
 fi
 
 # =========================
+# 👉 WHICH
+# =========================
+if [ "$COMMAND" == "which" ]; then
+
+  TLD=$(get_tld)
+  CURRENT_DIR=$(pwd)
+
+  site_name=""
+  php_ver=""
+
+  for link in "$SITES_DIR"/*/; do
+    link="${link%/}"
+    [ -L "$link" ] || continue
+    real_dir=$(readlink -f "$link" 2>/dev/null || true)
+    if [[ "$CURRENT_DIR" == "$real_dir"* ]]; then
+      site_name=$(basename "$link")
+      [ -f "$real_dir/.php-version" ] && php_ver=$(cat "$real_dir/.php-version")
+      break
+    fi
+  done
+
+  echo ""
+  if [ -n "$site_name" ]; then
+    if [ -n "$php_ver" ]; then
+      echo "  Sitio  : $site_name.$TLD"
+      echo "  PHP    : $php_ver (aislado)"
+      echo "  Socket : $(get_php_socket "${php_ver#php@}")"
+    else
+      global_socket=$(get_global_socket)
+      if [ -f "$DEFAULT_PHP_FILE" ]; then
+        global_ver=$(cat "$DEFAULT_PHP_FILE")
+      else
+        global_ver="sistema ($(php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?'))"
+      fi
+      echo "  Sitio  : $site_name.$TLD"
+      echo "  PHP    : $global_ver (global)"
+      echo "  Socket : $global_socket"
+    fi
+  else
+    echo "  El directorio actual no está enlazado como sitio de Valet"
+    echo "  Usa: valet link [nombre]  o  cd carpeta-parqueada"
+  fi
+  echo ""
+fi
+
+# =========================
+# 👉 DIAGNOSE
+# =========================
+if [ "$COMMAND" == "diagnose" ]; then
+
+  TLD=$(get_tld)
+
+  echo ""
+  echo "=== Valet Diagnose ==="
+  echo ""
+
+  echo "Sistema:"
+  echo "  OS     : $(cat /etc/fedora-release 2>/dev/null || uname -sr)"
+  echo "  Kernel : $(uname -r)"
+  echo "  SELinux: $(getenforce 2>/dev/null || echo 'N/A')"
+  echo ""
+
+  echo "PHP:"
+  echo "  Sistema : $(php -r 'echo PHP_VERSION;' 2>/dev/null || echo 'no encontrado')"
+  if [ -f "$DEFAULT_PHP_FILE" ]; then
+    echo "  Global  : $(cat "$DEFAULT_PHP_FILE") (valet use)"
+  fi
+  echo ""
+
+  echo "Servicios:"
+  for svc in nginx php-fpm NetworkManager; do
+    if systemctl is-active --quiet "$svc"; then
+      echo "  ✅ $svc"
+    else
+      echo "  ❌ $svc"
+    fi
+  done
+  if pgrep -x dnsmasq > /dev/null; then
+    echo "  ✅ dnsmasq (proceso activo)"
+  else
+    echo "  ❌ dnsmasq (proceso no encontrado)"
+  fi
+  echo ""
+
+  echo "DNS:"
+  resolv_target=$(readlink /etc/resolv.conf 2>/dev/null || echo "archivo regular")
+  echo "  resolv.conf → $resolv_target"
+  echo "  nameservers : $(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+  if nslookup google.com 127.0.0.1 &>/dev/null; then
+    echo "  internet    : ✅ google.com resuelve via 127.0.0.1"
+  else
+    echo "  internet    : ❌ google.com NO resuelve via 127.0.0.1"
+  fi
+  if nslookup "valet-test.$TLD" 127.0.0.1 2>/dev/null | grep -q '127\.0\.0\.1'; then
+    echo "  wildcard    : ✅ *.$TLD → 127.0.0.1"
+  else
+    echo "  wildcard    : ❌ *.$TLD no resuelve a 127.0.0.1"
+  fi
+  echo ""
+
+  echo "Configuración:"
+  echo "  TLD    : .$TLD"
+  echo "  NM dns : $(grep '^dns=' /etc/NetworkManager/NetworkManager.conf 2>/dev/null || echo 'no configurado')"
+  echo "  Home   : $VALET_HOME"
+  echo "  Sites  : $(ls "$SITES_DIR" 2>/dev/null | wc -l) sitio(s) enlazados"
+  echo ""
+
+  echo "Nginx:"
+  nginx_test=$(sudo nginx -t 2>&1) || true
+  if echo "$nginx_test" | grep -q "successful"; then
+    echo "  config : ✅ válida"
+  else
+    echo "  config : ❌ errores"
+    echo "$nginx_test" | sed 's/^/  /'
+  fi
+  echo ""
+fi
+
+# =========================
 # 👉 HELP
 # =========================
 if [ -z "$COMMAND" ]; then
@@ -1255,6 +1374,10 @@ if [ -z "$COMMAND" ]; then
   echo "HTTPS:"
   echo "  secure [nombre]                  Habilita HTTPS con certificado autofirmado"
   echo "  unsecure [nombre]                Deshabilita HTTPS"
+  echo ""
+  echo "Diagnóstico:"
+  echo "  which                            Muestra qué PHP usa el directorio actual"
+  echo "  diagnose                         Reporte de estado del sistema"
   echo ""
   echo "Servicios:"
   echo "  start                            Inicia nginx y php-fpm"
