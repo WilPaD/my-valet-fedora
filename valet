@@ -1,0 +1,1245 @@
+#!/bin/bash
+
+set -e
+
+COMMAND=$1
+shift 2>/dev/null || true
+
+USER_NAME=$(whoami)
+VALET_HOME="$HOME/.config/valet"
+SITES_DIR="$VALET_HOME/Sites"
+CERTS_DIR="$VALET_HOME/certs"
+TLD_FILE="$VALET_HOME/tld"
+PARKED_FILE="$VALET_HOME/parked"
+NGINX_WILDCARD="/etc/nginx/conf.d/valet-wildcard.conf"
+DEFAULT_PHP_FILE="$VALET_HOME/default-php"
+
+# =========================
+# Helpers
+# =========================
+
+get_tld() {
+  cat "$TLD_FILE" 2>/dev/null || echo "test"
+}
+
+write_config_json() {
+  local tld=$1
+  cat > "$VALET_HOME/config.json" <<EOF
+{
+    "tld": "$tld",
+    "loopback": "127.0.0.1",
+    "default-php": "php"
+}
+EOF
+}
+
+# Detecta el socket de PHP-FPM para una versión dada (compatible con Remi en Fedora)
+get_php_socket() {
+  local version=$1
+  local short
+  short=$(echo "$version" | tr -d '.')
+  local remi_sock="/var/opt/remi/php${short}/run/php-fpm/www.sock"
+  if [ -S "$remi_sock" ]; then
+    echo "$remi_sock"
+  else
+    echo "/run/php-fpm/www.sock"
+  fi
+}
+
+# Devuelve el socket global activo (sistema o Remi si hay versión guardada)
+get_global_socket() {
+  if [ -f "$DEFAULT_PHP_FILE" ]; then
+    local ver
+    ver=$(sed 's/php@//' "$DEFAULT_PHP_FILE")
+    get_php_socket "$ver"
+  else
+    echo "/run/php-fpm/www.sock"
+  fi
+}
+
+# Ruta del nginx config por sitio
+nginx_site_conf() {
+  echo "/etc/nginx/conf.d/valet-site-${1}.conf"
+}
+
+reload_nginx() {
+  sudo nginx -t && sudo systemctl reload nginx
+}
+
+# Genera/sobreescribe el nginx wildcard con el TLD y Sites dir actuales
+# $1 = tld, $2 = socket PHP (opcional, por defecto usa get_global_socket)
+write_nginx_wildcard() {
+  local tld=$1
+  local php_socket=${2:-$(get_global_socket)}
+  sudo tee "$NGINX_WILDCARD" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name *.$tld;
+
+    set \$project "";
+    if (\$host ~* ^(.+)\\.$tld\$) {
+        set \$project \$1;
+    }
+
+    root $SITES_DIR/\$project/public;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \\.php\$ {
+        include fastcgi_params;
+        fastcgi_pass unix:$php_socket;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param VALET_SITE_PATH $SITES_DIR/\$project;
+        fastcgi_param PHP_VALUE "auto_prepend_file=$VALET_HOME/server.php";
+    }
+}
+EOF
+}
+
+# Crea/actualiza el server.php de Valet (watchdog de hot files de Vite)
+write_server_php() {
+  cat > "$VALET_HOME/server.php" << 'PHPEOF'
+<?php
+/**
+ * Valet server.php — Vite hot-file watchdog
+ *
+ * Se ejecuta antes de cada petición PHP via auto_prepend_file.
+ * Si public/hot existe pero el dev server de Vite ya no está corriendo,
+ * elimina el archivo para que Laravel use el build compilado en su lugar.
+ * Esto evita la pantalla en blanco cuando se para el dev server sin Ctrl+C.
+ */
+
+$sitePath = $_SERVER['VALET_SITE_PATH'] ?? null;
+if (!$sitePath) return;
+
+$hotFile = $sitePath . '/public/hot';
+if (!file_exists($hotFile)) return;
+
+$hotUrl = trim(file_get_contents($hotFile));
+if (empty($hotUrl)) {
+    @unlink($hotFile);
+    return;
+}
+
+$parsed = parse_url($hotUrl);
+$host   = trim($parsed['host'] ?? '127.0.0.1', '[]'); // [::1] → ::1
+$port   = (int)($parsed['port'] ?? 5173);
+
+// En localhost, connection refused es prácticamente instantáneo (~1ms)
+// Solo tarda si hay filtrado de red (no aplica en localhost)
+$socket = @fsockopen($host, $port, $errno, $errstr, 1);
+if ($socket === false) {
+    @unlink($hotFile);
+} else {
+    fclose($socket);
+}
+PHPEOF
+}
+
+# Aplica SELinux para un directorio de proyecto
+selinux_project() {
+  local dir=$1
+  sudo semanage fcontext -a -t httpd_sys_content_t "${dir}(/.*)?" 2>/dev/null || true
+  sudo semanage fcontext -a -t httpd_sys_rw_content_t "${dir}/storage(/.*)?" 2>/dev/null || true
+  sudo semanage fcontext -a -t httpd_sys_rw_content_t "${dir}/bootstrap/cache(/.*)?" 2>/dev/null || true
+  sudo semanage fcontext -a -t httpd_sys_rw_content_t "${dir}/database(/.*)?" 2>/dev/null || true
+  sudo restorecon -R "$dir" 2>/dev/null || true
+}
+
+# =========================
+# Rollback global
+# =========================
+ROLLBACK_ACTIONS=()
+
+add_rollback() {
+  ROLLBACK_ACTIONS+=("$1")
+}
+
+run_rollback() {
+  echo ""
+  echo "❌ Error detectado. Ejecutando rollback..."
+  for (( i=${#ROLLBACK_ACTIONS[@]}-1; i>=0; i-- )); do
+    eval "${ROLLBACK_ACTIONS[$i]}"
+  done
+  echo "🔄 Rollback completado"
+  exit 1
+}
+
+trap run_rollback ERR
+
+# =========================
+# 👉 INSTALL
+# =========================
+if [ "$COMMAND" == "install" ]; then
+
+  echo "🚀 Instalando Valet..."
+
+  command -v nginx    >/dev/null || { echo "❌ Instala nginx";                      exit 1; }
+  command -v php      >/dev/null || { echo "❌ Instala PHP";                        exit 1; }
+  command -v composer >/dev/null || { echo "❌ Instala composer";                   exit 1; }
+  command -v dnsmasq  >/dev/null || { echo "❌ Instala dnsmasq: sudo dnf install dnsmasq"; exit 1; }
+
+  # Crear estructura de configuración
+  mkdir -p "$SITES_DIR" "$CERTS_DIR"
+  [ -f "$TLD_FILE"    ] || echo "test"   > "$TLD_FILE"
+  [ -f "$PARKED_FILE" ] || touch           "$PARKED_FILE"
+  write_config_json "$(get_tld)"
+
+  # Permitir que nginx traversa el home dir para servir archivos estáticos
+  setfacl -m u:nginx:--x "$HOME"
+
+  # Crear server.php (watchdog de hot files de Vite)
+  write_server_php
+
+  TLD=$(get_tld)
+
+  # -------------------------
+  # PHP-FPM como usuario actual
+  # -------------------------
+  echo "⚙️  Configurando PHP-FPM como $USER_NAME..."
+
+  PHP_FPM_CONF="/etc/php-fpm.d/www.conf"
+  # Solo hacer backup si no existe uno previo, para no sobreescribir el original
+  if [ ! -f "${PHP_FPM_CONF}.bak" ]; then
+    sudo cp "$PHP_FPM_CONF" "${PHP_FPM_CONF}.bak"
+    add_rollback "sudo mv ${PHP_FPM_CONF}.bak $PHP_FPM_CONF"
+  fi
+
+  sudo sed -i "s/^user = .*/user = $USER_NAME/"               "$PHP_FPM_CONF"
+  sudo sed -i "s/^group = .*/group = $USER_NAME/"              "$PHP_FPM_CONF"
+  sudo sed -i "s/^listen\.owner = .*/listen.owner = $USER_NAME/" "$PHP_FPM_CONF"
+  sudo sed -i "s/^listen\.group = .*/listen.group = $USER_NAME/" "$PHP_FPM_CONF"
+
+  # -------------------------
+  # SELinux
+  # -------------------------
+  echo "🔐 Ajustando SELinux..."
+
+  sudo setsebool -P httpd_read_user_content  on
+  sudo setsebool -P httpd_can_network_connect on
+  sudo setsebool -P httpd_enable_homedirs    on
+
+  sudo chmod 1777 /tmp
+
+  # Contexto SELinux para el directorio de Valet
+  sudo semanage fcontext -a -t httpd_sys_content_t "$VALET_HOME(/.*)?"   2>/dev/null || true
+  sudo semanage fcontext -a -t httpd_config_t       "$CERTS_DIR(/.*)?"   2>/dev/null || true
+  sudo restorecon -R "$VALET_HOME" 2>/dev/null || true
+
+  # -------------------------
+  # DNS wildcard con dnsmasq via NetworkManager
+  # /etc/hosts no soporta wildcards — usamos dnsmasq
+  # -------------------------
+  echo "🌍 Configurando DNS wildcard .$TLD..."
+
+  if ! grep -q "^dns=dnsmasq" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
+    sudo sed -i '/^\[main\]/a dns=dnsmasq' /etc/NetworkManager/NetworkManager.conf
+    add_rollback "sudo sed -i '/^dns=dnsmasq/d' /etc/NetworkManager/NetworkManager.conf"
+  fi
+
+  # Fallback a DNS públicos: NM dnsmasq usa primero el DNS de la conexión activa
+  # (DHCP), y estos entran solo si no hay upstream disponible aún (boot, red nueva).
+  sudo mkdir -p /etc/NetworkManager/dnsmasq.d
+  printf "address=/.$TLD/127.0.0.1\nserver=1.1.1.1\nserver=8.8.8.8\n" \
+    | sudo tee /etc/NetworkManager/dnsmasq.d/valet.conf > /dev/null
+  add_rollback "sudo rm -f /etc/NetworkManager/dnsmasq.d/valet.conf"
+
+  sudo systemctl restart NetworkManager
+  sleep 2  # dar tiempo a que el dnsmasq interno de NM arranque
+
+  # En Fedora con systemd-resolved, /etc/resolv.conf apunta a systemd-resolved
+  # y bloquea el dnsmasq de NetworkManager. Lo corregimos apuntando al de NM.
+  RESOLV_TARGET=$(readlink /etc/resolv.conf 2>/dev/null || true)
+  if [[ "$RESOLV_TARGET" == *"systemd/resolve"* ]]; then
+    echo "🔧 Corrigiendo resolv.conf (systemd-resolved → NetworkManager dnsmasq)..."
+    sudo rm /etc/resolv.conf
+    sudo ln -sf /run/NetworkManager/resolv.conf /etc/resolv.conf
+    add_rollback "sudo rm /etc/resolv.conf && sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf"
+  fi
+
+  # Verificar que el DNS funciona tras el cambio
+  if ! nslookup google.com 127.0.0.1 &>/dev/null; then
+    echo "⚠️  dnsmasq no responde aún, esperando..."
+    sleep 3
+    if ! nslookup google.com 127.0.0.1 &>/dev/null; then
+      echo "⚠️  DNS no responde, usando fallback directo (1.1.1.1)"
+      printf "nameserver 127.0.0.1\nnameserver 1.1.1.1\n" | sudo tee /etc/resolv.conf > /dev/null
+    fi
+  fi
+
+  # -------------------------
+  # Nginx
+  # -------------------------
+  echo "🌐 Configurando Nginx..."
+
+  NGINX_MAIN="/etc/nginx/nginx.conf"
+  if [ ! -s "$NGINX_MAIN" ]; then
+    sudo tee "$NGINX_MAIN" > /dev/null <<'EOF'
+user nginx;
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    sendfile on;
+    keepalive_timeout 65;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+EOF
+  fi
+
+  write_nginx_wildcard "$TLD"
+
+  sudo systemctl enable --now php-fpm
+  sudo systemctl enable --now nginx
+  sudo systemctl restart php-fpm
+  sudo systemctl restart nginx
+  sudo nginx -t
+
+  echo ""
+  echo "✅ Valet instalado"
+  echo "   TLD activo : .$TLD"
+  echo "   Config     : $VALET_HOME"
+  echo "   Sites      : $SITES_DIR"
+  echo ""
+  echo "💡 Próximo paso: cd ~/tu-carpeta-de-proyectos && valet park"
+  echo ""
+fi
+
+# =========================
+# 👉 PARK
+# =========================
+if [ "$COMMAND" == "park" ]; then
+
+  PARK_PATH=${1:-$(pwd)}
+  [[ "$PARK_PATH" != /* ]] && PARK_PATH="$(pwd)/$PARK_PATH"
+  PARK_PATH=$(realpath "$PARK_PATH")
+
+  [ -d "$PARK_PATH" ] || { echo "❌ El directorio no existe: $PARK_PATH"; exit 1; }
+
+  # Añadir a la lista de parqueados si no está
+  if ! grep -qxF "$PARK_PATH" "$PARKED_FILE" 2>/dev/null; then
+    echo "$PARK_PATH" >> "$PARKED_FILE"
+    echo "📌 Parqueo añadido: $PARK_PATH"
+  else
+    echo "ℹ️  Ya estaba parqueado, actualizando enlaces..."
+  fi
+
+  echo "🔗 Enlazando proyectos existentes..."
+  count=0
+
+  for project_dir in "$PARK_PATH"/*/; do
+    [ -d "$project_dir" ] || continue
+    project_name=$(basename "$project_dir")
+    link_target="$SITES_DIR/$project_name"
+
+    if [ -L "$link_target" ]; then
+      echo "  ⏭️  $project_name (ya enlazado)"
+    elif [ -e "$link_target" ]; then
+      echo "  ⚠️  $project_name (conflicto, omitido)"
+    else
+      ln -sf "$project_dir" "$link_target"
+      selinux_project "$project_dir"
+      echo "  ✅ $project_name"
+      count=$((count + 1))
+    fi
+  done
+
+  echo ""
+  echo "✅ Parqueo configurado ($count nuevos proyectos enlazados)"
+  echo "   Ruta  : $PARK_PATH"
+  echo "💡 Re-ejecuta 'valet park' para enlazar proyectos nuevos que añadas después"
+  echo ""
+fi
+
+# =========================
+# 👉 FORGET
+# =========================
+if [ "$COMMAND" == "forget" ]; then
+
+  PARK_PATH=${1:-$(pwd)}
+  [[ "$PARK_PATH" != /* ]] && PARK_PATH="$(pwd)/$PARK_PATH"
+  PARK_PATH=$(realpath "$PARK_PATH" 2>/dev/null || echo "$PARK_PATH")
+
+  if ! grep -qxF "$PARK_PATH" "$PARKED_FILE" 2>/dev/null; then
+    echo "❌ Ruta no parqueada: $PARK_PATH"
+    exit 1
+  fi
+
+  grep -vxF "$PARK_PATH" "$PARKED_FILE" > "${PARKED_FILE}.tmp" && mv "${PARKED_FILE}.tmp" "$PARKED_FILE"
+
+  echo "🗑️  Eliminando enlaces de $PARK_PATH..."
+  for link in "$SITES_DIR"/*/; do
+    link="${link%/}"
+    [ -L "$link" ] || continue
+    link_target=$(readlink -f "$link" 2>/dev/null || true)
+    if [[ "$link_target" == "$PARK_PATH"* ]]; then
+      site_name=$(basename "$link")
+      rm -f "$link"
+      sudo rm -f "$(nginx_site_conf "$site_name")" 2>/dev/null || true
+      echo "  🗑️  $site_name"
+    fi
+  done
+
+  reload_nginx 2>/dev/null || true
+  echo "✅ Parqueo eliminado: $PARK_PATH"
+  echo ""
+fi
+
+# =========================
+# 👉 LINK
+# =========================
+if [ "$COMMAND" == "link" ]; then
+
+  TLD=$(get_tld)
+  LINK_NAME=${1:-$(basename "$(pwd)")}
+  CURRENT_DIR=$(pwd)
+  LINK_PATH="$SITES_DIR/$LINK_NAME"
+
+  if [ -e "$LINK_PATH" ] || [ -L "$LINK_PATH" ]; then
+    echo "❌ Ya existe un sitio '$LINK_NAME'"
+    echo "   Usa: valet unlink $LINK_NAME"
+    exit 1
+  fi
+
+  ln -sf "$CURRENT_DIR" "$LINK_PATH"
+  selinux_project "$CURRENT_DIR"
+
+  echo "✅ Enlace creado: http://$LINK_NAME.$TLD"
+  echo "   Apunta a: $CURRENT_DIR"
+  echo ""
+fi
+
+# =========================
+# 👉 UNLINK
+# =========================
+if [ "$COMMAND" == "unlink" ]; then
+
+  LINK_NAME=${1:-$(basename "$(pwd)")}
+  LINK_PATH="$SITES_DIR/$LINK_NAME"
+
+  if [ ! -L "$LINK_PATH" ]; then
+    echo "❌ No existe el enlace '$LINK_NAME'"
+    exit 1
+  fi
+
+  rm -f "$LINK_PATH"
+  sudo rm -f "$(nginx_site_conf "$LINK_NAME")" 2>/dev/null || true
+  reload_nginx 2>/dev/null || true
+
+  echo "✅ Enlace eliminado: $LINK_NAME"
+  echo ""
+fi
+
+# =========================
+# 👉 NEW  (extensión: no existe en Valet real)
+# =========================
+if [ "$COMMAND" == "new" ]; then
+
+  TLD=$(get_tld)
+  APP_NAME=${1:-my-app}
+
+  PARKED_PATH=$(head -1 "$PARKED_FILE" 2>/dev/null || echo "$HOME/valet")
+  mkdir -p "$PARKED_PATH"
+  BASE_DIR="$PARKED_PATH/$APP_NAME"
+  LINK_PATH="$SITES_DIR/$APP_NAME"
+
+  if [ -d "$BASE_DIR" ] && [ "$(ls -A "$BASE_DIR" 2>/dev/null)" ]; then
+    echo "❌ El directorio ya existe y no está vacío: $BASE_DIR"
+    exit 1
+  fi
+  [ -d "$BASE_DIR" ] && rmdir "$BASE_DIR" 2>/dev/null || true
+
+  echo "📦 Creando proyecto Laravel en $BASE_DIR..."
+
+  TMPDIR_VALET="/tmp/valet_$APP_NAME"
+  mkdir -p "$TMPDIR_VALET"
+  chmod 777 "$TMPDIR_VALET"
+  export TMPDIR="$TMPDIR_VALET"
+
+  cd "$PARKED_PATH"
+  composer create-project laravel/laravel "$APP_NAME"
+
+  unset TMPDIR
+  rm -rf "$TMPDIR_VALET"
+
+  echo "🔧 Configurando permisos..."
+  chmod -R 775 "$BASE_DIR/storage" "$BASE_DIR/bootstrap/cache" "$BASE_DIR/database"
+  find "$BASE_DIR" -type f -name "*.php" -exec chmod 644 {} \;
+  chmod +x "$BASE_DIR/artisan"
+  sudo chown -R "$USER_NAME:$USER_NAME" "$BASE_DIR"
+
+  # Git
+  read -p "¿Inicializar repositorio Git? (y/N): " -n 1 -r; echo
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    cd "$BASE_DIR"
+    git init 2>/dev/null || true
+    read -p "¿Configurar GitFlow? (y/N): " -n 1 -r; echo
+    [[ $REPLY =~ ^[Yy]$ ]] && { git flow init -d 2>/dev/null || true; }
+    cd "$PARKED_PATH"
+  fi
+
+  # SELinux
+  echo "🔐 Configurando SELinux..."
+  selinux_project "$BASE_DIR"
+  sudo semanage fcontext -a -t httpd_sys_rw_content_t "$BASE_DIR/public/uploads(/.*)?" 2>/dev/null || true
+  sudo restorecon -R "$BASE_DIR" 2>/dev/null || true
+
+  # storage:link
+  cd "$BASE_DIR"
+  php artisan storage:link 2>/dev/null || true
+  cd "$PARKED_PATH"
+
+  # Enlazar en Sites
+  if [ ! -e "$LINK_PATH" ]; then
+    ln -sf "$BASE_DIR" "$LINK_PATH"
+  fi
+
+  echo ""
+  echo "✅ Proyecto listo: http://$APP_NAME.$TLD"
+  echo "   Ruta: $BASE_DIR"
+  echo ""
+fi
+
+# =========================
+# 👉 ISOLATE
+# =========================
+if [ "$COMMAND" == "isolate" ]; then
+
+  TLD=$(get_tld)
+  PHP_ARG=$1
+  SITE_ARG=$2
+
+  [[ "$PHP_ARG" =~ php@([0-9]+\.[0-9]+) ]] || { echo "❌ Uso: valet isolate php@8.2 --site=nombre"; exit 1; }
+  PHP_VERSION="${BASH_REMATCH[1]}"
+
+  [[ "$SITE_ARG" =~ ^--site=(.+)$ ]] || { echo "❌ Uso: valet isolate php@8.2 --site=nombre"; exit 1; }
+  SITE_NAME="${BASH_REMATCH[1]}"
+
+  [ -e "$SITES_DIR/$SITE_NAME" ] || { echo "❌ Sitio no encontrado: $SITE_NAME (¿hiciste valet park o valet link?)"; exit 1; }
+
+  echo "⚙️  Activando PHP $PHP_VERSION para $SITE_NAME..."
+
+  # Arrancar el servicio PHP-FPM de esa versión (Remi: php8.2-php-fpm)
+  sudo systemctl enable --now "php${PHP_VERSION}-php-fpm" \
+    || { echo "❌ Servicio php${PHP_VERSION}-php-fpm no encontrado. ¿Está instalado el paquete remi?"; exit 1; }
+
+  sleep 1
+  PHP_SOCKET=$(get_php_socket "$PHP_VERSION")
+  [ -S "$PHP_SOCKET" ] || echo "⚠️  Socket aún no disponible: $PHP_SOCKET (puede tardar unos segundos)"
+
+  # Guardar versión en el proyecto
+  REAL_SITE_DIR=$(readlink -f "$SITES_DIR/$SITE_NAME")
+  echo "php@$PHP_VERSION" > "$REAL_SITE_DIR/.php-version"
+  add_rollback "rm -f $REAL_SITE_DIR/.php-version"
+
+  # Nginx per-site config que sobreescribe el wildcard para este sitio
+  sudo tee "$(nginx_site_conf "$SITE_NAME")" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $SITE_NAME.$TLD;
+
+    root $SITES_DIR/$SITE_NAME/public;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \\.php\$ {
+        include fastcgi_params;
+        fastcgi_pass unix:$PHP_SOCKET;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param VALET_SITE_PATH $SITES_DIR/$SITE_NAME;
+        fastcgi_param PHP_VALUE "auto_prepend_file=$VALET_HOME/server.php";
+    }
+}
+EOF
+
+  reload_nginx
+
+  echo ""
+  echo "✅ $SITE_NAME ahora usa PHP $PHP_VERSION"
+  echo "   Socket: $PHP_SOCKET"
+  echo ""
+fi
+
+# =========================
+# 👉 UNISOLATE
+# =========================
+if [ "$COMMAND" == "unisolate" ]; then
+
+  SITE_ARG=$1
+  [[ "$SITE_ARG" =~ ^--site=(.+)$ ]] || { echo "❌ Uso: valet unisolate --site=nombre"; exit 1; }
+  SITE_NAME="${BASH_REMATCH[1]}"
+
+  SITE_CONF="$(nginx_site_conf "$SITE_NAME")"
+  REAL_SITE_DIR=$(readlink -f "$SITES_DIR/$SITE_NAME" 2>/dev/null || true)
+
+  if [ -f "$SITE_CONF" ]; then
+    sudo rm -f "$SITE_CONF"
+    reload_nginx
+    echo "✅ Aislamiento eliminado: $SITE_NAME vuelve a usar el PHP por defecto"
+  else
+    echo "ℹ️  $SITE_NAME no estaba aislado"
+  fi
+
+  [ -n "$REAL_SITE_DIR" ] && rm -f "$REAL_SITE_DIR/.php-version" 2>/dev/null || true
+  echo ""
+fi
+
+# =========================
+# 👉 ISOLATED  (lista sitios aislados)
+# =========================
+if [ "$COMMAND" == "isolated" ]; then
+
+  TLD=$(get_tld)
+  echo ""
+  echo "Sitios aislados:"
+  echo ""
+
+  found=0
+  for conf in /etc/nginx/conf.d/valet-site-*.conf; do
+    [ -f "$conf" ] || continue
+    # Solo considerar aislados (los secure también tienen per-site conf)
+    site_name=$(basename "$conf" .conf | sed 's/valet-site-//')
+    real_dir=$(readlink -f "$SITES_DIR/$site_name" 2>/dev/null || true)
+    if [ -f "$real_dir/.php-version" ]; then
+      php_ver=$(cat "$real_dir/.php-version")
+      printf "  %-30s %s\n" "$site_name.$TLD" "$php_ver"
+      found=$((found + 1))
+    fi
+  done
+
+  [ "$found" -eq 0 ] && echo "  (ninguno)"
+  echo ""
+fi
+
+# =========================
+# 👉 SECURE
+# =========================
+if [ "$COMMAND" == "secure" ]; then
+
+  TLD=$(get_tld)
+  SITE_NAME=${1:-$(basename "$(pwd)")}
+
+  command -v openssl >/dev/null || { echo "❌ Instala openssl"; exit 1; }
+  [ -e "$SITES_DIR/$SITE_NAME" ] || { echo "❌ Sitio no encontrado: $SITE_NAME"; exit 1; }
+
+  CERT_KEY="$CERTS_DIR/$SITE_NAME.key"
+  CERT_CRT="$CERTS_DIR/$SITE_NAME.crt"
+  SITE_DIR="$SITES_DIR/$SITE_NAME"
+
+  echo "🔒 Generando certificado para $SITE_NAME.$TLD..."
+
+  openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
+    -keyout "$CERT_KEY" \
+    -out    "$CERT_CRT" \
+    -subj   "/CN=$SITE_NAME.$TLD" \
+    -addext "subjectAltName=DNS:$SITE_NAME.$TLD" 2>/dev/null
+
+  # Confiar en el cert a nivel sistema (Fedora)
+  sudo cp "$CERT_CRT" "/etc/pki/ca-trust/source/anchors/valet-$SITE_NAME.crt"
+  sudo update-ca-trust
+
+  # SELinux para los certs
+  sudo semanage fcontext -a -t httpd_config_t "$CERTS_DIR(/.*)?" 2>/dev/null || true
+  sudo restorecon -R "$CERTS_DIR" 2>/dev/null || true
+
+  # Detectar si el sitio está aislado para usar su socket PHP
+  PHP_SOCKET="/run/php-fpm/www.sock"
+  REAL_SITE_DIR=$(readlink -f "$SITE_DIR" 2>/dev/null || true)
+  if [ -f "$REAL_SITE_DIR/.php-version" ]; then
+    PHP_VER=$(cat "$REAL_SITE_DIR/.php-version" | sed 's/php@//')
+    PHP_SOCKET=$(get_php_socket "$PHP_VER")
+  fi
+
+  # Nginx per-site con HTTP→HTTPS redirect + HTTP/2
+  sudo tee "$(nginx_site_conf "$SITE_NAME")" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $SITE_NAME.$TLD;
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $SITE_NAME.$TLD;
+
+    ssl_certificate     $CERT_CRT;
+    ssl_certificate_key $CERT_KEY;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+
+    root $SITE_DIR/public;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \\.php\$ {
+        include fastcgi_params;
+        fastcgi_pass unix:$PHP_SOCKET;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param HTTPS on;
+        fastcgi_param VALET_SITE_PATH $SITE_DIR;
+        fastcgi_param PHP_VALUE "auto_prepend_file=$VALET_HOME/server.php";
+    }
+}
+EOF
+
+  reload_nginx
+
+  echo ""
+  echo "✅ HTTPS habilitado: https://$SITE_NAME.$TLD"
+  echo "⚠️  Si tu navegador no confía en el cert, impórtalo manualmente:"
+  echo "   $CERT_CRT"
+  echo ""
+fi
+
+# =========================
+# 👉 UNSECURE
+# =========================
+if [ "$COMMAND" == "unsecure" ]; then
+
+  TLD=$(get_tld)
+  SITE_NAME=${1:-$(basename "$(pwd)")}
+
+  CERT_KEY="$CERTS_DIR/$SITE_NAME.key"
+  CERT_CRT="$CERTS_DIR/$SITE_NAME.crt"
+  SITE_CONF="$(nginx_site_conf "$SITE_NAME")"
+  SITE_DIR="$SITES_DIR/$SITE_NAME"
+
+  # Quitar del trust del sistema
+  sudo rm -f "/etc/pki/ca-trust/source/anchors/valet-$SITE_NAME.crt" 2>/dev/null || true
+  sudo update-ca-trust 2>/dev/null || true
+
+  rm -f "$CERT_KEY" "$CERT_CRT"
+
+  # Si el sitio sigue aislado, regenerar su config HTTP sin HTTPS
+  REAL_SITE_DIR=$(readlink -f "$SITE_DIR" 2>/dev/null || true)
+  if [ -f "$REAL_SITE_DIR/.php-version" ]; then
+    PHP_VER=$(cat "$REAL_SITE_DIR/.php-version" | sed 's/php@//')
+    PHP_SOCKET=$(get_php_socket "$PHP_VER")
+    sudo tee "$SITE_CONF" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $SITE_NAME.$TLD;
+
+    root $SITE_DIR/public;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \\.php\$ {
+        include fastcgi_params;
+        fastcgi_pass unix:$PHP_SOCKET;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param VALET_SITE_PATH $SITE_DIR;
+        fastcgi_param PHP_VALUE "auto_prepend_file=$VALET_HOME/server.php";
+    }
+}
+EOF
+  else
+    # Sin aislamiento ni HTTPS → eliminar per-site config, el wildcard toma el control
+    sudo rm -f "$SITE_CONF" 2>/dev/null || true
+  fi
+
+  reload_nginx
+
+  echo "✅ HTTPS eliminado: http://$SITE_NAME.$TLD"
+  echo ""
+fi
+
+# =========================
+# 👉 LIST
+# =========================
+if [ "$COMMAND" == "list" ]; then
+
+  TLD=$(get_tld)
+  echo ""
+  printf "  %-35s %-12s %-8s %s\n" "Sitio" "PHP" "HTTPS" "Ruta real"
+  printf "  %-35s %-12s %-8s %s\n" "-----" "---" "-----" "---------"
+
+  for link in "$SITES_DIR"/*/; do
+    link="${link%/}"
+    [ -e "$link" ] || [ -L "$link" ] || continue
+    site_name=$(basename "$link")
+    real_path=$(readlink -f "$link" 2>/dev/null || echo "?")
+
+    php_ver="default"
+    [ -f "$real_path/.php-version" ] && php_ver=$(cat "$real_path/.php-version")
+
+    https="no"
+    [ -f "$CERTS_DIR/$site_name.crt" ] && https="sí"
+
+    printf "  %-35s %-12s %-8s %s\n" "$site_name.$TLD" "$php_ver" "$https" "$real_path"
+  done
+
+  echo ""
+fi
+
+# =========================
+# 👉 PATHS
+# =========================
+if [ "$COMMAND" == "paths" ]; then
+
+  echo ""
+  echo "Rutas parqueadas:"
+  echo ""
+
+  if [ -s "$PARKED_FILE" ]; then
+    while IFS= read -r path; do
+      echo "  📁 $path"
+    done < "$PARKED_FILE"
+  else
+    echo "  (ninguna — usa: valet park)"
+  fi
+  echo ""
+fi
+
+# =========================
+# 👉 START / STOP / RESTART
+# =========================
+if [ "$COMMAND" == "start" ]; then
+  echo "▶️  Iniciando servicios..."
+  sudo systemctl start php-fpm nginx
+  echo "✅ Servicios iniciados"
+fi
+
+if [ "$COMMAND" == "stop" ]; then
+  echo "⏹️  Deteniendo servicios..."
+  sudo systemctl stop php-fpm nginx
+  echo "✅ Servicios detenidos"
+fi
+
+if [ "$COMMAND" == "restart" ]; then
+  echo "🔄 Reiniciando servicios..."
+  sudo systemctl restart php-fpm nginx
+  echo "✅ Servicios reiniciados"
+fi
+
+# =========================
+# 👉 STATUS
+# =========================
+if [ "$COMMAND" == "status" ]; then
+
+  TLD=$(get_tld)
+  echo ""
+  echo "Estado de servicios:"
+  echo ""
+  for svc in nginx php-fpm; do
+    if systemctl is-active --quiet "$svc"; then
+      echo "  ✅ $svc (activo)"
+    else
+      echo "  ❌ $svc (inactivo)"
+    fi
+  done
+  echo ""
+  echo "  TLD    : .$TLD"
+  echo "  Sites  : $SITES_DIR"
+  echo "  Config : $VALET_HOME"
+  echo ""
+fi
+
+# =========================
+# 👉 TLD
+# =========================
+if [ "$COMMAND" == "tld" ] || [ "$COMMAND" == "domain" ]; then
+
+  NEW_TLD=$1
+
+  if [ -z "$NEW_TLD" ]; then
+    echo "TLD actual: .$(get_tld)"
+    exit 0
+  fi
+
+  OLD_TLD=$(get_tld)
+  echo "$NEW_TLD" > "$TLD_FILE"
+  write_config_json "$NEW_TLD"
+
+  # Actualizar dnsmasq
+  printf "address=/.$NEW_TLD/127.0.0.1\nserver=1.1.1.1\nserver=8.8.8.8\n" \
+    | sudo tee /etc/NetworkManager/dnsmasq.d/valet.conf > /dev/null
+  sudo systemctl restart NetworkManager
+
+  # Regenerar nginx wildcard con el nuevo TLD (conservando el PHP global activo)
+  write_nginx_wildcard "$NEW_TLD" "$(get_global_socket)"
+  reload_nginx
+
+  echo "✅ TLD cambiado: .$OLD_TLD → .$NEW_TLD"
+  echo "⚠️  Los per-site configs (isolated/secure) necesitan ser regenerados manualmente"
+  echo ""
+fi
+
+# =========================
+# 👉 UNINSTALL
+# =========================
+if [ "$COMMAND" == "uninstall" ]; then
+
+  echo "🗑️  Desinstalando Valet..."
+  echo "⚠️  Esto eliminará toda la configuración de Valet"
+  echo ""
+
+  read -p "¿Estás seguro? (y/N): " -n 1 -r; echo
+  [[ ! $REPLY =~ ^[Yy]$ ]] && { echo "❌ Cancelado"; exit 0; }
+
+  # Restaurar PHP-FPM
+  PHP_FPM_CONF="/etc/php-fpm.d/www.conf"
+  if [ -f "${PHP_FPM_CONF}.bak" ]; then
+    echo "📝 Restaurando PHP-FPM..."
+    sudo mv "${PHP_FPM_CONF}.bak" "$PHP_FPM_CONF"
+  fi
+
+  # Eliminar configs nginx
+  echo "🌐 Eliminando configuración Nginx..."
+  sudo rm -f "$NGINX_WILDCARD"
+  sudo rm -f /etc/nginx/conf.d/valet-site-*.conf
+
+  # Eliminar DNS
+  if [ -f "/etc/NetworkManager/dnsmasq.d/valet.conf" ]; then
+    echo "🌍 Eliminando DNS..."
+    sudo rm -f /etc/NetworkManager/dnsmasq.d/valet.conf
+    sudo sed -i '/^dns=dnsmasq/d' /etc/NetworkManager/NetworkManager.conf
+    sudo systemctl restart NetworkManager
+
+    # Restaurar resolv.conf a systemd-resolved si el install lo cambió
+    RESOLV_TARGET=$(readlink /etc/resolv.conf 2>/dev/null || true)
+    if [[ "$RESOLV_TARGET" == *"NetworkManager/resolv.conf"* ]]; then
+      echo "🔧 Restaurando resolv.conf a systemd-resolved..."
+      sudo rm /etc/resolv.conf
+      sudo ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+      sudo systemctl restart systemd-resolved 2>/dev/null || true
+    fi
+  fi
+
+  # Eliminar config Xdebug de Valet
+  sudo rm -f /etc/php.d/99-valet-xdebug.ini 2>/dev/null || true
+  for confdir in /etc/opt/remi/php*/php.d/; do
+    sudo rm -f "${confdir}99-valet-xdebug.ini" 2>/dev/null || true
+  done
+
+  # Eliminar certs del trust del sistema
+  sudo rm -f /etc/pki/ca-trust/source/anchors/valet-*.crt 2>/dev/null || true
+  sudo update-ca-trust 2>/dev/null || true
+
+  # Eliminar directorio de configuración (opcional)
+  if [ -d "$VALET_HOME" ]; then
+    read -p "¿Eliminar $VALET_HOME (sites, certs, config)? (y/N): " -n 1 -r; echo
+    [[ $REPLY =~ ^[Yy]$ ]] && rm -rf "$VALET_HOME"
+  fi
+
+  sudo systemctl restart php-fpm 2>/dev/null || true
+  sudo systemctl restart nginx  2>/dev/null || true
+
+  echo ""
+  echo "✅ Valet desinstalado completamente"
+  echo ""
+fi
+
+# =========================
+# 👉 PHP (switch version)
+# =========================
+if [ "$COMMAND" == "use" ]; then
+
+  PHP_ARG=$1
+  SITE_ARG=$2
+  TLD=$(get_tld)
+
+  # ── Sin argumentos: mostrar estado ──────────────────────────────────────────
+  if [ -z "$PHP_ARG" ]; then
+
+    echo ""
+    if [ -f "$DEFAULT_PHP_FILE" ]; then
+      global_ver=$(cat "$DEFAULT_PHP_FILE")
+      global_socket=$(get_global_socket)
+    else
+      global_ver="sistema ($(php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?'))"
+      global_socket="/run/php-fpm/www.sock"
+    fi
+    echo "  Global : $global_ver  [$global_socket]"
+    echo ""
+    echo "  Por sitio:"
+
+    found=0
+    for link in "$SITES_DIR"/*/; do
+      link="${link%/}"
+      [ -e "$link" ] || [ -L "$link" ] || continue
+      site_name=$(basename "$link")
+      real_dir=$(readlink -f "$link" 2>/dev/null || true)
+      if [ -f "$real_dir/.php-version" ]; then
+        ver=$(cat "$real_dir/.php-version")
+        printf "    %-30s %s\n" "$site_name.$TLD" "$ver"
+        found=$((found + 1))
+      fi
+    done
+    [ "$found" -eq 0 ] && echo "    (ninguno — todos usan la versión global)"
+    echo ""
+    exit 0
+  fi
+
+  # ── Validar formato ──────────────────────────────────────────────────────────
+  if [ "$PHP_ARG" != "system" ]; then
+    [[ "$PHP_ARG" =~ ^php@([0-9]+\.[0-9]+)$ ]] || {
+      echo "❌ Uso: valet php [php@X.X|system] [--site=nombre]"
+      exit 1
+    }
+    PHP_VERSION="${BASH_REMATCH[1]}"
+    PHP_SHORT="${PHP_VERSION/./}"   # 8.2 → 82
+    FPM_SERVICE="php${PHP_SHORT}-php-fpm"
+  fi
+
+  # ── Con --site: cambio per-site ──────────────────────────────────────────────
+  if [[ "$SITE_ARG" =~ ^--site=(.+)$ ]]; then
+
+    SITE_NAME="${BASH_REMATCH[1]}"
+    SITE_CONF="$(nginx_site_conf "$SITE_NAME")"
+    REAL_SITE_DIR=$(readlink -f "$SITES_DIR/$SITE_NAME" 2>/dev/null || true)
+
+    [ -e "$SITES_DIR/$SITE_NAME" ] || { echo "❌ Sitio no encontrado: $SITE_NAME"; exit 1; }
+
+    if [ "$PHP_ARG" == "system" ]; then
+      sudo rm -f "$SITE_CONF" 2>/dev/null || true
+      [ -n "$REAL_SITE_DIR" ] && rm -f "$REAL_SITE_DIR/.php-version" 2>/dev/null || true
+      reload_nginx
+      echo "✅ $SITE_NAME → versión global"
+    else
+      sudo systemctl enable --now "$FPM_SERVICE" \
+        || { echo "❌ Servicio $FPM_SERVICE no encontrado. ¿Está instalado el paquete remi?"; exit 1; }
+      sleep 1
+      PHP_SOCKET=$(get_php_socket "$PHP_VERSION")
+      [ -S "$PHP_SOCKET" ] || echo "⚠️  Socket aún no disponible: $PHP_SOCKET"
+
+      echo "php@$PHP_VERSION" > "$REAL_SITE_DIR/.php-version"
+
+      sudo tee "$SITE_CONF" > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $SITE_NAME.$TLD;
+
+    root $SITES_DIR/$SITE_NAME/public;
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \\.php\$ {
+        include fastcgi_params;
+        fastcgi_pass unix:$PHP_SOCKET;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param VALET_SITE_PATH $SITES_DIR/$SITE_NAME;
+        fastcgi_param PHP_VALUE "auto_prepend_file=$VALET_HOME/server.php";
+    }
+}
+EOF
+      reload_nginx
+      echo "✅ $SITE_NAME → PHP $PHP_VERSION  [$PHP_SOCKET]"
+    fi
+
+  # ── Sin --site: cambio global ────────────────────────────────────────────────
+  else
+
+    if [ "$PHP_ARG" == "system" ]; then
+      echo "⚙️  Restaurando PHP del sistema como versión global..."
+      rm -f "$DEFAULT_PHP_FILE"
+      write_nginx_wildcard "$TLD" "/run/php-fpm/www.sock"
+      sudo systemctl restart php-fpm
+      reload_nginx
+      echo "✅ PHP global → sistema ($(php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?'))"
+    else
+      echo "⚙️  Cambiando PHP global a $PHP_VERSION..."
+      sudo systemctl enable --now "$FPM_SERVICE" \
+        || { echo "❌ Servicio $FPM_SERVICE no encontrado. ¿Está instalado el paquete remi?"; exit 1; }
+      sleep 1
+      PHP_SOCKET=$(get_php_socket "$PHP_VERSION")
+      [ -S "$PHP_SOCKET" ] || echo "⚠️  Socket aún no disponible: $PHP_SOCKET"
+
+      echo "php@$PHP_VERSION" > "$DEFAULT_PHP_FILE"
+      write_nginx_wildcard "$TLD" "$PHP_SOCKET"
+      reload_nginx
+      echo "✅ PHP global → $PHP_VERSION  [$PHP_SOCKET]"
+    fi
+
+  fi
+
+  echo ""
+fi
+
+# =========================
+# 👉 XDEBUG
+# =========================
+if [ "$COMMAND" == "xdebug" ]; then
+
+  ACTION=$1
+
+  # Devuelve líneas "label|bin|conf_dir|fpm_service" para cada PHP instalado
+  discover_php_versions() {
+    # PHP del sistema
+    if command -v php &>/dev/null; then
+      local ver
+      ver=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "?")
+      echo "default (${ver})|php|/etc/php.d|php-fpm"
+    fi
+
+    # Versiones Remi: detectadas por sus directorios de configuración
+    for confdir in /etc/opt/remi/php*/; do
+      [ -d "${confdir}php.d" ] || continue
+      local remi_name short ver bin_path
+      remi_name=$(basename "$confdir")   # php82
+      short=${remi_name#php}             # 82
+      ver="${short:0:1}.${short:1}"      # 8.2
+
+      # Buscar el binario de esta versión Remi
+      bin_path=$(command -v "php${short}" 2>/dev/null \
+               || echo "/opt/remi/${remi_name}/root/usr/bin/php")
+      [ -x "$bin_path" ] || continue
+
+      echo "remi-${ver}|${bin_path}|${confdir}php.d|${remi_name}-php-fpm"
+    done
+  }
+
+  write_xdebug_ini() {
+    local conf_dir=$1 mode=$2
+    if [ "$mode" == "on" ]; then
+      sudo tee "${conf_dir}/99-valet-xdebug.ini" > /dev/null <<'XEOF'
+; Valet — Xdebug global config
+xdebug.mode=debug,develop
+xdebug.start_with_request=yes
+xdebug.client_host=127.0.0.1
+xdebug.client_port=9003
+xdebug.discover_client_host=false
+xdebug.idekey=VALET
+XEOF
+    else
+      sudo tee "${conf_dir}/99-valet-xdebug.ini" > /dev/null <<'XEOF'
+; Valet — Xdebug global config
+xdebug.mode=off
+XEOF
+    fi
+  }
+
+  if [ "$ACTION" == "on" ] || [ "$ACTION" == "off" ]; then
+
+    echo "🐛 Xdebug ${ACTION}..."
+    echo ""
+    found=0
+
+    while IFS='|' read -r label bin_path conf_dir fpm_service; do
+      if ! "$bin_path" --ri xdebug &>/dev/null; then
+        printf "  ⚠️  %-24s Xdebug no instalado\n" "$label"
+        if [[ "$label" == remi-* ]]; then
+          ver=${label#remi-}; short=${ver/./}
+          echo "       → sudo dnf install php${short}-php-pecl-xdebug3"
+        else
+          echo "       → sudo dnf install php-pecl-xdebug3"
+        fi
+        continue
+      fi
+
+      write_xdebug_ini "$conf_dir" "$ACTION"
+
+      if systemctl is-active --quiet "$fpm_service"; then
+        sudo systemctl restart "$fpm_service"
+        printf "  ✅  %-24s reiniciado\n" "$label"
+      else
+        printf "  ✅  %-24s (inactivo, config escrita)\n" "$label"
+      fi
+      found=$((found + 1))
+    done < <(discover_php_versions)
+
+    echo ""
+    if [ "$found" -eq 0 ]; then
+      echo "❌ Ninguna versión de PHP tiene Xdebug instalado"
+    else
+      echo "✅ Xdebug ${ACTION} en ${found} versión(es) de PHP"
+      [ "$ACTION" == "on" ] && echo "   Puerto: 9003 | IDE key: VALET"
+    fi
+
+  elif [ "$ACTION" == "status" ] || [ -z "$ACTION" ]; then
+
+    echo ""
+    echo "Estado de Xdebug por versión PHP:"
+    echo ""
+
+    while IFS='|' read -r label bin_path conf_dir fpm_service; do
+      if ! "$bin_path" --ri xdebug &>/dev/null; then
+        printf "  %-26s no instalado\n" "$label"
+        continue
+      fi
+      mode=$("$bin_path" -r "echo ini_get('xdebug.mode');" 2>/dev/null || echo "off")
+      if [[ "$mode" == *"debug"* ]]; then
+        port=$("$bin_path" -r "echo ini_get('xdebug.client_port');" 2>/dev/null || echo "9003")
+        printf "  %-26s ACTIVO   modo=%-18s puerto=%s\n" "$label" "$mode" "$port"
+      else
+        printf "  %-26s inactivo\n" "$label"
+      fi
+    done < <(discover_php_versions)
+
+  else
+    echo "❌ Uso: valet xdebug [on|off|status]"
+    exit 1
+  fi
+
+  echo ""
+fi
+
+# =========================
+# 👉 HELP
+# =========================
+if [ -z "$COMMAND" ]; then
+
+  TLD=$(get_tld)
+  echo ""
+  echo "Valet — Laravel Valet para Fedora/Linux"
+  echo ""
+  echo "Uso: valet <comando> [opciones]"
+  echo ""
+  echo "Configuración:"
+  echo "  install                          Instala y configura el sistema"
+  echo "  uninstall                        Elimina toda la configuración"
+  echo "  tld [tld]                        Muestra o cambia el TLD (actual: .$TLD)"
+  echo ""
+  echo "Sitios:"
+  echo "  park [ruta]                      Parquea carpeta; cada subcarpeta = un sitio"
+  echo "  forget [ruta]                    Elimina parqueo"
+  echo "  link [nombre]                    Enlaza el directorio actual como nombre.$TLD"
+  echo "  unlink [nombre]                  Elimina un enlace"
+  echo "  new [nombre]                     Crea nuevo proyecto Laravel"
+  echo "  list                             Lista todos los sitios"
+  echo "  paths                            Lista rutas parqueadas"
+  echo ""
+  echo "PHP:"
+  echo "  use                              Muestra versión global y por sitio"
+  echo "  use php@X.X                      Cambia la versión PHP global"
+  echo "  use system                       Restaura el PHP del sistema como global"
+  echo "  use php@X.X --site=nombre        Cambia la versión PHP de un sitio"
+  echo "  use system --site=nombre         Restaura un sitio a la versión global"
+  echo "  isolate php@X.X --site=nombre    (alias legacy de use php@X.X --site=nombre)"
+  echo "  unisolate --site=nombre          (alias legacy de use system --site=nombre)"
+  echo "  isolated                         Lista sitios con versión PHP distinta a la global"
+  echo "  xdebug [on|off|status]           Activa/desactiva Xdebug globalmente (puerto 9003)"
+  echo ""
+  echo "HTTPS:"
+  echo "  secure [nombre]                  Habilita HTTPS con certificado autofirmado"
+  echo "  unsecure [nombre]                Deshabilita HTTPS"
+  echo ""
+  echo "Servicios:"
+  echo "  start                            Inicia nginx y php-fpm"
+  echo "  stop                             Detiene nginx y php-fpm"
+  echo "  restart                          Reinicia nginx y php-fpm"
+  echo "  status                           Estado de los servicios"
+  echo ""
+fi
