@@ -247,6 +247,20 @@ if [ "$COMMAND" == "install" ]; then
     | sudo tee /etc/NetworkManager/dnsmasq.d/valet.conf > /dev/null
   add_rollback "sudo rm -f /etc/NetworkManager/dnsmasq.d/valet.conf"
 
+  # SELinux: NetworkManager con dns=dnsmasq crea /etc/.resolv.conf.NetworkManager
+  # como symlink. Sin este contexto SELinux lo bloquea en cada boot rompiendo el DNS.
+  sudo semanage fcontext -a -t net_conf_t '/etc/\.resolv\.conf\.NetworkManager' 2>/dev/null || true
+
+  # El servicio dnsmasq standalone ocupa el puerto 53 y bloquea el dnsmasq
+  # interno de NetworkManager. Lo deshabilitamos: NM gestiona su propio dnsmasq.
+  # Guardamos el estado previo para restaurarlo en valet uninstall.
+  if systemctl is-enabled --quiet dnsmasq 2>/dev/null; then
+    touch "$VALET_HOME/.dnsmasq-was-enabled"
+  else
+    rm -f "$VALET_HOME/.dnsmasq-was-enabled"
+  fi
+  sudo systemctl disable --now dnsmasq 2>/dev/null || true
+
   sudo systemctl restart NetworkManager
   sleep 2  # dar tiempo a que el dnsmasq interno de NM arranque
 
@@ -914,6 +928,12 @@ if [ "$COMMAND" == "uninstall" ]; then
     sudo rm -f /etc/NetworkManager/dnsmasq.d/valet.conf
     sudo sed -i '/^dns=dnsmasq/d' /etc/NetworkManager/NetworkManager.conf
     sudo systemctl restart NetworkManager
+
+    # Restaurar dnsmasq standalone solo si estaba habilitado antes de valet install
+    if [ -f "$VALET_HOME/.dnsmasq-was-enabled" ]; then
+      sudo systemctl enable --now dnsmasq 2>/dev/null || true
+      rm -f "$VALET_HOME/.dnsmasq-was-enabled"
+    fi
 
     # Restaurar resolv.conf a systemd-resolved si el install lo cambió
     RESOLV_TARGET=$(readlink /etc/resolv.conf 2>/dev/null || true)
