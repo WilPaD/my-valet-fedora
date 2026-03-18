@@ -11,6 +11,43 @@ mkdir -p "$BIN_DIR"
 ln -sf "$SCRIPT_DIR/valet" "$BIN_DIR/valet"
 chmod +x "$SCRIPT_DIR/valet"
 
+# Shim de PHP: intercepta llamadas a `php` y resuelve la versión
+# correcta según .php-version del proyecto (compatible con cualquier IDE)
+cat > "$BIN_DIR/php" <<'SHIM'
+#!/bin/bash
+# Valet PHP shim — resuelve la versión de PHP según .php-version del proyecto
+
+resolve_binary() {
+  local version="$1"
+  local ver="${version#php@}"
+  local short="${ver/./}"
+  for candidate in \
+    "/usr/bin/php${short}" \
+    "/opt/remi/php${short}/root/usr/bin/php"; do
+    [ -x "$candidate" ] && { echo "$candidate"; return; }
+  done
+  echo "/usr/bin/php"
+}
+
+# Subir por los directorios buscando .php-version
+dir="$PWD"
+while [ "$dir" != "/" ]; do
+  if [ -f "$dir/.php-version" ]; then
+    exec "$(resolve_binary "$(cat "$dir/.php-version")")" "$@"
+  fi
+  dir=$(dirname "$dir")
+done
+
+# Sin .php-version — usar el global de valet o el sistema
+valet_default="$HOME/.config/valet/default-php"
+if [ -f "$valet_default" ]; then
+  exec "$(resolve_binary "$(cat "$valet_default")")" "$@"
+fi
+
+exec /usr/bin/php "$@"
+SHIM
+chmod +x "$BIN_DIR/php"
+
 # Verificar que ~/.local/bin está en el PATH
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
   echo ""
@@ -22,5 +59,6 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
 fi
 
 echo "✅ valet-fedora instalado → $BIN_DIR/valet"
+echo "✅ PHP shim instalado   → $BIN_DIR/php"
 echo "   Próximo paso: valet install"
 echo ""
