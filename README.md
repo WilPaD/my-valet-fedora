@@ -1,6 +1,6 @@
 # valet-fedora
 
-Puerto de [Laravel Valet](https://laravel.com/docs/valet) para Fedora/Linux.
+Port de [Laravel Valet](https://laravel.com/docs/valet) para Fedora/Linux.
 
 Entorno de desarrollo local con nginx, PHP-FPM, dnsmasq (via NetworkManager) y soporte completo de SELinux.
 
