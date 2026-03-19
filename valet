@@ -1269,6 +1269,19 @@ XEOF
 fi
 
 # =========================
+# 👉 VERSION
+# =========================
+if [ "$COMMAND" == "version" ] || [ "$COMMAND" == "--version" ] || [ "$COMMAND" == "-v" ]; then
+  VERSION_FILE="$(dirname "$(realpath "$0")")/VERSION"
+  if [ -f "$VERSION_FILE" ]; then
+    echo "valet-fedora $(cat "$VERSION_FILE")"
+  else
+    echo "valet-fedora (versión desconocida)"
+  fi
+  exit 0
+fi
+
+# =========================
 # 👉 WHICH
 # =========================
 if [ "$COMMAND" == "which" ]; then
@@ -1402,6 +1415,7 @@ if [ -z "$COMMAND" ]; then
   echo "  install                          Instala y configura el sistema"
   echo "  uninstall                        Elimina toda la configuración"
   echo "  tld [tld]                        Muestra o cambia el TLD (actual: .$TLD)"
+  echo "  version                          Muestra la versión instalada"
   echo ""
   echo "Sitios:"
   echo "  park [ruta]                      Parquea carpeta; cada subcarpeta = un sitio"
