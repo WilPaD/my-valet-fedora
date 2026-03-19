@@ -4,6 +4,13 @@ Puerto de [Laravel Valet](https://laravel.com/docs/valet) para Fedora/Linux.
 
 Entorno de desarrollo local con nginx, PHP-FPM, dnsmasq (via NetworkManager) y soporte completo de SELinux.
 
+## Requisitos
+
+```bash
+sudo dnf install nginx php-fpm php-cli dnsmasq openssl acl bind-utils git \
+                 policycoreutils-python-utils composer
+```
+
 ## Instalación rápida (desde source)
 
 ```bash
@@ -102,15 +109,6 @@ directorio del proyecto.
 # 2. ~/.config/valet/default-php (valet use global)
 # 3. /usr/bin/php (sistema)
 ```
-
-## Requisitos
-
-- Fedora (cualquier versión)
-- nginx, php-fpm, php-cli
-- dnsmasq, NetworkManager
-- openssl, acl, bind-utils, git
-- policycoreutils-python-utils (para `semanage`)
-- composer (recomendado)
 
 ## Licencia
 
