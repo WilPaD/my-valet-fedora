@@ -14,8 +14,8 @@ sudo dnf install nginx php-fpm php-cli dnsmasq openssl acl bind-utils git \
 ## Instalación rápida (desde source)
 
 ```bash
-git clone https://github.com/usuario/valet-fedora
-cd valet-fedora
+git clone git@github.com:WilPaD/my-valet-fedora.git
+cd my-valet-fedora
 ./install.sh
 valet install
 ```
@@ -32,8 +32,8 @@ sudo dnf install rpm-build rpmdevtools rpmlint
 
 ```bash
 # 1. Clona el repositorio
-git clone https://github.com/usuario/valet-fedora
-cd valet-fedora
+git clone git@github.com:WilPaD/my-valet-fedora.git
+cd my-valet-fedora
 
 # 2. Construye el RPM
 make rpm
