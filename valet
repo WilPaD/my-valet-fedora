@@ -57,6 +57,35 @@ get_global_socket() {
   fi
 }
 
+# Returns systemd service name for a PHP version ("8.4" or "php@8.4")
+get_fpm_service() {
+  local version="${1#php@}"
+  [ -z "$version" ] && { echo "php-fpm"; return; }
+  local short="${version/./}"
+  if [ -d "/etc/opt/remi/php${short}" ]; then
+    echo "php${short}-php-fpm"
+  else
+    echo "php-fpm"
+  fi
+}
+
+# Lists all valet-managed FPM services (system php-fpm + enabled/active Remi)
+list_managed_fpm_services() {
+  if systemctl is-enabled --quiet php-fpm 2>/dev/null || \
+     systemctl is-active  --quiet php-fpm 2>/dev/null; then
+    echo "php-fpm"
+  fi
+  for svcfile in /usr/lib/systemd/system/php*-php-fpm.service; do
+    [ -f "$svcfile" ] || continue
+    local svc
+    svc=$(basename "$svcfile" .service)
+    [[ "$svc" =~ ^php[0-9]+-php-fpm$ ]] || continue
+    systemctl is-enabled --quiet "$svc" 2>/dev/null || \
+    systemctl is-active  --quiet "$svc" 2>/dev/null || continue
+    echo "$svc"
+  done
+}
+
 # Ruta del nginx config por sitio
 nginx_site_conf() {
   echo "/etc/nginx/conf.d/valet-site-${1}.conf"
@@ -184,6 +213,16 @@ SHIM
   chmod +x "$shim_path"
 }
 
+# Aplica contextos SELinux para directorios de una versión Remi PHP
+# $1 = short version, e.g. "84" o "82"
+# Usa /opt/remi/... porque SELinux tiene equivalencia /var/opt → /opt
+selinux_remi_php() {
+  local short=$1
+  sudo semanage fcontext -a -t httpd_log_t     "/opt/remi/php${short}/log(/.*)?"  2>/dev/null || true
+  sudo semanage fcontext -a -t httpd_var_run_t "/opt/remi/php${short}/run(/.*)?"  2>/dev/null || true
+  sudo restorecon -R "/var/opt/remi/php${short}/" 2>/dev/null || true
+}
+
 # Aplica SELinux para un directorio de proyecto
 selinux_project() {
   local dir=$1
@@ -262,6 +301,19 @@ if [ "$COMMAND" == "install" ]; then
   sudo sed -i "s/^listen\.owner = .*/listen.owner = $USER_NAME/" "$PHP_FPM_CONF"
   sudo sed -i "s/^listen\.group = .*/listen.group = $USER_NAME/" "$PHP_FPM_CONF"
 
+  # Configurar pools de PHP-FPM Remi (todas las versiones instaladas)
+  for remi_conf in /etc/opt/remi/php*/php-fpm.d/www.conf; do
+    [ -f "$remi_conf" ] || continue
+    if [ ! -f "${remi_conf}.bak" ]; then
+      sudo cp "$remi_conf" "${remi_conf}.bak"
+    fi
+    sudo sed -i "s/^user = .*/user = $USER_NAME/"                  "$remi_conf"
+    sudo sed -i "s/^group = .*/group = $USER_NAME/"                "$remi_conf"
+    sudo sed -i "s/^listen\.owner = .*/listen.owner = $USER_NAME/" "$remi_conf"
+    sudo sed -i "s/^listen\.group = .*/listen.group = $USER_NAME/" "$remi_conf"
+    echo "  ⚙️  Remi: $(echo "$remi_conf" | grep -oP 'php\d+') configurado como $USER_NAME"
+  done
+
   # -------------------------
   # SELinux
   # -------------------------
@@ -277,6 +329,13 @@ if [ "$COMMAND" == "install" ]; then
   sudo semanage fcontext -a -t httpd_sys_content_t "$VALET_HOME(/.*)?"   2>/dev/null || true
   sudo semanage fcontext -a -t httpd_config_t       "$CERTS_DIR(/.*)?"   2>/dev/null || true
   sudo restorecon -R "$VALET_HOME" 2>/dev/null || true
+
+  # SELinux para versiones Remi instaladas
+  for confdir in /etc/opt/remi/php*/; do
+    [ -d "$confdir" ] || continue
+    remi_short=$(basename "$confdir" | sed 's/php//')
+    [[ "$remi_short" =~ ^[0-9]+$ ]] && selinux_remi_php "$remi_short"
+  done
 
   # -------------------------
   # DNS wildcard con dnsmasq via NetworkManager
@@ -593,6 +652,8 @@ if [ "$COMMAND" == "isolate" ]; then
   echo "⚙️  Activando PHP $PHP_VERSION para $SITE_NAME..."
 
   # Arrancar el servicio PHP-FPM de esa versión (Remi: php8.2-php-fpm)
+  isolate_short="${PHP_VERSION/./}"
+  selinux_remi_php "$isolate_short"
   sudo systemctl enable --now "php${PHP_VERSION}-php-fpm" \
     || { echo "❌ Servicio php${PHP_VERSION}-php-fpm no encontrado. ¿Está instalado el paquete remi?"; exit 1; }
 
@@ -878,19 +939,25 @@ fi
 # =========================
 if [ "$COMMAND" == "start" ]; then
   echo "▶️  Iniciando servicios..."
-  sudo systemctl start php-fpm nginx
+  sudo systemctl start nginx
+  while IFS= read -r svc; do sudo systemctl start "$svc"; done \
+    < <(list_managed_fpm_services)
   echo "✅ Servicios iniciados"
 fi
 
 if [ "$COMMAND" == "stop" ]; then
   echo "⏹️  Deteniendo servicios..."
-  sudo systemctl stop php-fpm nginx
+  sudo systemctl stop nginx
+  while IFS= read -r svc; do sudo systemctl stop "$svc"; done \
+    < <(list_managed_fpm_services)
   echo "✅ Servicios detenidos"
 fi
 
 if [ "$COMMAND" == "restart" ]; then
   echo "🔄 Reiniciando servicios..."
-  sudo systemctl restart php-fpm nginx
+  sudo systemctl restart nginx
+  while IFS= read -r svc; do sudo systemctl restart "$svc"; done \
+    < <(list_managed_fpm_services)
   echo "✅ Servicios reiniciados"
 fi
 
@@ -903,13 +970,20 @@ if [ "$COMMAND" == "status" ]; then
   echo ""
   echo "Estado de servicios:"
   echo ""
-  for svc in nginx php-fpm; do
+  for svc in nginx NetworkManager; do
     if systemctl is-active --quiet "$svc"; then
       echo "  ✅ $svc (activo)"
     else
       echo "  ❌ $svc (inactivo)"
     fi
   done
+  while IFS= read -r svc; do
+    if systemctl is-active --quiet "$svc"; then
+      echo "  ✅ $svc (activo)"
+    else
+      echo "  ❌ $svc (inactivo)"
+    fi
+  done < <(list_managed_fpm_services)
   echo ""
   echo "  TLD    : .$TLD"
   echo "  Sites  : $SITES_DIR"
@@ -966,6 +1040,13 @@ if [ "$COMMAND" == "uninstall" ]; then
     sudo mv "${PHP_FPM_CONF}.bak" "$PHP_FPM_CONF"
   fi
 
+  # Restaurar configs Remi PHP-FPM
+  for remi_bak in /etc/opt/remi/php*/php-fpm.d/www.conf.bak; do
+    [ -f "$remi_bak" ] || continue
+    sudo mv "$remi_bak" "${remi_bak%.bak}"
+    echo "📝 Restaurando $(echo "$remi_bak" | grep -oP 'php\d+') www.conf"
+  done
+
   # Eliminar configs nginx
   echo "🌐 Eliminando configuración Nginx..."
   sudo rm -f "$NGINX_WILDCARD"
@@ -1013,8 +1094,10 @@ if [ "$COMMAND" == "uninstall" ]; then
   # Eliminar shim de PHP
   rm -f "$HOME/.local/bin/php"
 
-  sudo systemctl restart php-fpm 2>/dev/null || true
-  sudo systemctl restart nginx  2>/dev/null || true
+  while IFS= read -r svc; do
+    sudo systemctl restart "$svc" 2>/dev/null || true
+  done < <(list_managed_fpm_services)
+  sudo systemctl restart nginx 2>/dev/null || true
 
   echo ""
   echo "✅ Valet desinstalado completamente"
@@ -1088,6 +1171,7 @@ if [ "$COMMAND" == "use" ]; then
       reload_nginx
       echo "✅ $SITE_NAME → versión global"
     else
+      selinux_remi_php "$PHP_SHORT"
       sudo systemctl enable --now "$FPM_SERVICE" \
         || { echo "❌ Servicio $FPM_SERVICE no encontrado. ¿Está instalado el paquete remi?"; exit 1; }
       sleep 1
@@ -1133,6 +1217,7 @@ EOF
       echo "✅ PHP global → sistema ($(php -r 'echo PHP_VERSION;' 2>/dev/null || echo '?'))"
     else
       echo "⚙️  Cambiando PHP global a $PHP_VERSION..."
+      selinux_remi_php "$PHP_SHORT"
       sudo systemctl enable --now "$FPM_SERVICE" \
         || { echo "❌ Servicio $FPM_SERVICE no encontrado. ¿Está instalado el paquete remi?"; exit 1; }
       sleep 1
@@ -1349,16 +1434,34 @@ if [ "$COMMAND" == "diagnose" ]; then
   if [ -f "$DEFAULT_PHP_FILE" ]; then
     echo "  Global  : $(cat "$DEFAULT_PHP_FILE") (valet use)"
   fi
+  for confdir in /etc/opt/remi/php*/; do
+    [ -d "$confdir" ] || continue
+    remi_short=$(basename "$confdir" | sed 's/php//')
+    [[ "$remi_short" =~ ^[0-9]+$ ]] || continue
+    remi_ver="${remi_short:0:1}.${remi_short:1}"
+    remi_bin=$(command -v "php${remi_short}" 2>/dev/null \
+              || echo "/opt/remi/php${remi_short}/root/usr/bin/php")
+    if [ -x "$remi_bin" ]; then
+      echo "  Remi    : php@${remi_ver} ($("$remi_bin" -r 'echo PHP_VERSION;' 2>/dev/null || echo '?'))"
+    fi
+  done
   echo ""
 
   echo "Servicios:"
-  for svc in nginx php-fpm NetworkManager; do
+  for svc in nginx NetworkManager; do
     if systemctl is-active --quiet "$svc"; then
       echo "  ✅ $svc"
     else
       echo "  ❌ $svc"
     fi
   done
+  while IFS= read -r svc; do
+    if systemctl is-active --quiet "$svc"; then
+      echo "  ✅ $svc"
+    else
+      echo "  ❌ $svc"
+    fi
+  done < <(list_managed_fpm_services)
   if pgrep -x dnsmasq > /dev/null; then
     echo "  ✅ dnsmasq (proceso activo)"
   else
